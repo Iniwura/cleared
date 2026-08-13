@@ -1,5 +1,5 @@
 import { useEffect, useState, useRef } from "react";
-import { getTransaction } from "./gl";
+import { getTransaction, getTransactionStatus } from "./gl";
 
 // Polls for the real intermediate status of a transaction, PENDING,
 // PROPOSING, COMMITTING, REVEALING, ACCEPTED, FINALIZED, while a hash is
@@ -15,13 +15,20 @@ export function useLiveTxStatus(txHash) {
       return;
     }
 
+    setStatus(null);
+
     let cancelled = false;
 
     async function poll() {
       try {
         const tx = await getTransaction(txHash);
         if (!cancelled) {
-          setStatus(tx?.status_name || tx?.status || null);
+          const nextStatus = getTransactionStatus(tx);
+          setStatus(nextStatus);
+          if (String(nextStatus || "").toUpperCase() === "FINALIZED" && intervalRef.current) {
+            clearInterval(intervalRef.current);
+            intervalRef.current = null;
+          }
         }
       } catch (e) {
         // Transaction may not be indexed yet in the first second or two,

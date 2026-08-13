@@ -1,11 +1,13 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { readContract, writeContract, checkTransactionStatus, parseResult, friendlyError, getExplorerTxUrl } from "../lib/gl";
 import { useLiveTxStatus } from "../lib/useLiveTxStatus";
 import { CONTRACT_ADDRESS } from "../lib/config";
+import { refreshContractState } from "../lib/contractState";
 
-export default function ProfileTab({ connected, address, onRequireConnect }) {
+export default function ProfileTab({ connected, address, transactions, onTrackTransaction, stateVersion, onStateChanged, onRequireConnect }) {
   const [loan, setLoan] = useState(null);
   const [repaymentCount, setRepaymentCount] = useState(null);
+  const [poolBalance, setPoolBalance] = useState(null);
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -14,45 +16,115 @@ export default function ProfileTab({ connected, address, onRequireConnect }) {
   const [pendingTxHash, setPendingTxHash] = useState(null);
   const [pendingAction, setPendingAction] = useState(null); // "claim" | "repay"
   const [checkingAgain, setCheckingAgain] = useState(false);
+  const refreshId = useRef(0);
+  const claimStatus = transactions.claim?.status;
+  const repaymentStatus = transactions.repay?.status;
+  const defaultStatus = transactions["default-check"]?.status;
+  const latestTransaction = [transactions.claim, transactions.repay, transactions["default-check"]]
+    .filter(Boolean)
+    .sort((a, b) => b.submittedAt - a.submittedAt)[0];
+  const trackedStatus = latestTransaction?.action === "claim"
+    ? claimStatus
+    : latestTransaction?.action === "repay" ? repaymentStatus : defaultStatus;
   const liveStatus = useLiveTxStatus(liveTxHash || pendingTxHash);
 
-  async function loadProfile() {
+  function recordTxHash(action, hash) {
+    setLiveTxHash(hash);
+    onTrackTransaction(address, action, hash);
+  }
+
+  const loadProfile = useCallback(async (attempts = 1, predicate = null) => {
     if (!connected || !address) return;
+    const requestId = ++refreshId.current;
     setLoading(true);
     setError("");
     try {
-      const [loanRaw, repayRaw] = await Promise.all([
-        readContract(CONTRACT_ADDRESS, "get_loan", [address]),
-        readContract(CONTRACT_ADDRESS, "get_repayment_count", [address]),
-      ]);
-      setLoan(parseResult(loanRaw));
-      setRepaymentCount(parseResult(repayRaw).repayment_count);
+      const contractState = await refreshContractState(
+        address,
+        ["loan", "repaymentCount", "poolBalance"],
+        { attempts, predicate },
+      );
+      const snapshot = {
+        loan: contractState.loan,
+        repaymentCount: contractState.repaymentCount.repayment_count,
+        poolBalance: contractState.poolBalance.balance_gen,
+      };
+      if (requestId === refreshId.current) {
+        setLoan(snapshot.loan);
+        setRepaymentCount(snapshot.repaymentCount);
+        setPoolBalance(snapshot.poolBalance);
+      }
+      return snapshot;
     } catch (e) {
       console.error(e);
-      setError(friendlyError(e));
+      if (requestId === refreshId.current) setError(friendlyError(e));
+      return null;
     } finally {
-      setLoading(false);
+      if (requestId === refreshId.current) setLoading(false);
     }
-  }
+  }, [connected, address]);
+
+  useEffect(() => {
+    refreshId.current += 1;
+    setLoan(null);
+    setRepaymentCount(null);
+    setPoolBalance(null);
+    setError("");
+    setSuccessMsg("");
+    setLiveTxHash(null);
+    setPendingTxHash(null);
+    setPendingAction(null);
+  }, [connected, address]);
 
   useEffect(() => {
     loadProfile();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [connected, address]);
+    return () => {
+      refreshId.current += 1;
+    };
+  }, [connected, address, stateVersion, loadProfile]);
 
   async function fetchDecisionAndReload() {
-    const raw = await readContract(CONTRACT_ADDRESS, "get_last_decision", [address]);
-    const decision = parseResult(raw);
+    const contractState = await refreshContractState(
+      address,
+      ["decision", "loan", "repaymentCount", "poolBalance"],
+      {
+        attempts: 5,
+        predicate: ({ loan, repaymentCount: count }) => (
+          loan?.exists
+          && !loan.active
+          && !loan.defaulted
+          && count?.repayment_count > repaymentCount
+        ),
+      },
+    );
+    const decision = contractState.decision;
     if (decision.success === false) {
       setError(decision.message || "That didn't go through.");
     } else if (decision.success === true) {
       const refundGen = decision.refunded_wei ? decision.refunded_wei / 1e18 : 0;
       setSuccessMsg(refundGen > 0 ? `${decision.message} ${refundGen} GEN overpayment refunded.` : decision.message);
     }
-    await loadProfile();
+    setLoan(contractState.loan);
+    setRepaymentCount(contractState.repaymentCount.repayment_count);
+    setPoolBalance(contractState.poolBalance.balance_gen);
+  }
+
+  async function verifyClaimAndReload() {
+    const snapshot = await loadProfile(5, ({ loan: refreshedLoan }) => refreshedLoan?.claimed && refreshedLoan?.active);
+    if (!snapshot) return;
+    const currentLoan = snapshot.loan;
+    if (!currentLoan.claimed || !currentLoan.active) {
+      const decisionRaw = await readContract(CONTRACT_ADDRESS, "get_last_decision", [address]);
+      const decision = parseResult(decisionRaw);
+      setError(decision.message || "Claim was accepted, but the active loan state is not visible yet.");
+      return;
+    }
+    setLoan(currentLoan);
+    setSuccessMsg(`Claim accepted. ${currentLoan.principal_gen} GEN is active and due ${currentLoan.due_at?.slice(0, 10)}.`);
   }
 
   async function handleClaim() {
+    if (busy || pendingTxHash || claimAwaitingFinality) return;
     setBusy(true);
     setError("");
     setSuccessMsg("");
@@ -60,8 +132,9 @@ export default function ProfileTab({ connected, address, onRequireConnect }) {
     setLiveTxHash(null);
     setPendingAction("claim");
     try {
-      await writeContract(CONTRACT_ADDRESS, "claim_loan", [address], 0, setLiveTxHash);
-      await fetchDecisionAndReload();
+      await writeContract(CONTRACT_ADDRESS, "claim_loan", [address], 0, (hash) => recordTxHash("claim", hash));
+      await verifyClaimAndReload();
+      onStateChanged();
     } catch (e) {
       console.error(e);
       if (e.isPendingTimeout) {
@@ -77,7 +150,7 @@ export default function ProfileTab({ connected, address, onRequireConnect }) {
   }
 
   async function handleRepay() {
-    if (!loan?.owed_gen) return;
+    if (!loan?.owed_gen || busy || pendingTxHash || repaymentAwaitingFinality) return;
     setBusy(true);
     setError("");
     setSuccessMsg("");
@@ -85,8 +158,9 @@ export default function ProfileTab({ connected, address, onRequireConnect }) {
     setLiveTxHash(null);
     setPendingAction("repay");
     try {
-      await writeContract(CONTRACT_ADDRESS, "repay_loan", [address], loan.owed_gen, setLiveTxHash);
+      await writeContract(CONTRACT_ADDRESS, "repay_loan", [address], loan.owed_gen, (hash) => recordTxHash("repay", hash));
       await fetchDecisionAndReload();
+      onStateChanged();
     } catch (e) {
       console.error(e);
       if (e.isPendingTimeout) {
@@ -108,7 +182,15 @@ export default function ProfileTab({ connected, address, onRequireConnect }) {
     try {
       await checkTransactionStatus(pendingTxHash);
       setPendingTxHash(null);
-      await fetchDecisionAndReload();
+      if (pendingAction === "claim") {
+        await verifyClaimAndReload();
+      } else if (pendingAction === "default-check") {
+        await loadProfile();
+        setSuccessMsg("Default check accepted and reflected in live contract state.");
+      } else {
+        await fetchDecisionAndReload();
+      }
+      onStateChanged();
     } catch (e) {
       console.error(e);
       setError("Still not settled. Check the explorer directly if you want certainty before trying again.");
@@ -125,9 +207,10 @@ export default function ProfileTab({ connected, address, onRequireConnect }) {
     setLiveTxHash(null);
     setPendingAction("default-check");
     try {
-      await writeContract(CONTRACT_ADDRESS, "check_default", [address], 0, setLiveTxHash);
-      await loadProfile();
+      await writeContract(CONTRACT_ADDRESS, "check_default", [address], 0, (hash) => recordTxHash("default-check", hash));
+      await loadProfile(5);
       setSuccessMsg("Default check ran against live network data.");
+      onStateChanged();
     } catch (e) {
       console.error(e);
       if (e.isPendingTimeout) {
@@ -159,6 +242,10 @@ export default function ProfileTab({ connected, address, onRequireConnect }) {
 
   const hasUnclaimedOffer = loan?.exists && !loan.claimed && !loan.active && !loan.defaulted;
   const hasOpenBalance = loan?.exists && (loan.active || loan.defaulted);
+  const claimAwaitingFinality = transactions.claim?.hash
+    && String(claimStatus || "").toUpperCase() !== "FINALIZED";
+  const repaymentAwaitingFinality = transactions.repay?.hash
+    && String(repaymentStatus || "").toUpperCase() !== "FINALIZED";
 
   return (
     <div>
@@ -174,6 +261,15 @@ export default function ProfileTab({ connected, address, onRequireConnect }) {
           {liveStatus ? `Status: ${liveStatus}` : "Submitted, waiting on the network"}, consensus can pass through several stages before finishing.{" "}
           <a href={getExplorerTxUrl(liveTxHash)} target="_blank" rel="noreferrer" style={{ color: "var(--accent)" }}>
             Watch it live on the explorer
+          </a>
+        </div>
+      )}
+
+      {latestTransaction && !liveTxHash && !pendingTxHash && (
+        <div className="status-line" style={{ marginBottom: 16 }}>
+          Transaction status: {trackedStatus || "Submitted"}.{" "}
+          <a href={getExplorerTxUrl(latestTransaction.hash)} target="_blank" rel="noreferrer" style={{ color: "var(--accent)", wordBreak: "break-all" }}>
+            {latestTransaction.hash}
           </a>
         </div>
       )}
@@ -211,6 +307,10 @@ export default function ProfileTab({ connected, address, onRequireConnect }) {
               {loading ? "…" : hasOpenBalance ? `${loan.owed_gen} GEN` : "0 GEN"}
             </div>
           </div>
+          <div className="stat">
+            <div className="stat-label">Pool liquidity</div>
+            <div className="stat-value mono">{loading ? "…" : `${poolBalance ?? 0} GEN`}</div>
+          </div>
         </div>
 
         {!loading && hasUnclaimedOffer && (
@@ -218,7 +318,7 @@ export default function ProfileTab({ connected, address, onRequireConnect }) {
             <p className="status-line" style={{ marginBottom: 16 }}>
               Approved for {loan.principal_gen} GEN, not yet claimed · "{loan.reason || "no reason given"}"
             </p>
-            <button className="btn-primary" onClick={handleClaim} disabled={busy || Boolean(pendingTxHash)}>
+            <button className="btn-primary" onClick={handleClaim} disabled={busy || Boolean(pendingTxHash) || claimAwaitingFinality}>
               {busy && pendingAction === "claim" ? "Claiming…" : pendingTxHash ? "Awaiting confirmation, check above" : `Claim ${loan.principal_gen} GEN`}
             </button>
           </>
@@ -230,7 +330,7 @@ export default function ProfileTab({ connected, address, onRequireConnect }) {
               {loan.defaulted ? "Defaulted, past due" : `Due ${loan.due_at?.slice(0, 10)}`} · "{loan.reason || "no reason given"}"
             </p>
             <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-              <button className="btn-primary" onClick={handleRepay} disabled={busy || Boolean(pendingTxHash)}>
+              <button className="btn-primary" onClick={handleRepay} disabled={busy || Boolean(pendingTxHash) || repaymentAwaitingFinality}>
                 {busy && pendingAction === "repay" ? "Repaying…" : pendingTxHash ? "Awaiting confirmation, check above" : `Repay ${loan.owed_gen} GEN`}
               </button>
               {loan.active && !loan.defaulted && loan.due_at && new Date(loan.due_at) < new Date() && (

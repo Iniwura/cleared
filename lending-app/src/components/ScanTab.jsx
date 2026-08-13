@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
-import { writeContract, readContract, checkTransactionStatus, parseResult, friendlyError, getExplorerTxUrl } from "../lib/gl";
+import { writeContract, checkTransactionStatus, friendlyError, getExplorerTxUrl } from "../lib/gl";
 import { useLiveTxStatus } from "../lib/useLiveTxStatus";
 import { CONTRACT_ADDRESS, TIER_INFO, SCAN_FEE_GEN } from "../lib/config";
+import { refreshContractState } from "../lib/contractState";
 
 const HISTORY_KEY = "cleared_scan_history";
 const MAX_HISTORY = 10;
@@ -29,8 +30,8 @@ function saveToHistory(address, result) {
   return updated;
 }
 
-export default function ScanTab({ connected, onRequireConnect }) {
-  const [address, setAddress] = useState("");
+export default function ScanTab({ connected, address: connectedAddress, transactions, onTrackTransaction, stateVersion, onStateChanged, onRequireConnect }) {
+  const [address, setAddress] = useState(transactions.scan?.target || "");
   const [phase, setPhase] = useState("form");
   const [result, setResult] = useState(null);
   const [error, setError] = useState("");
@@ -39,15 +40,50 @@ export default function ScanTab({ connected, onRequireConnect }) {
   const [checkingAgain, setCheckingAgain] = useState(false);
   const [history, setHistory] = useState([]);
   const [retrying, setRetrying] = useState(false);
+  const [poolBalance, setPoolBalance] = useState(null);
+  const scanStatus = transactions.scan?.status;
   const liveStatus = useLiveTxStatus(liveTxHash || pendingTxHash);
+
+  function recordTxHash(target, hash) {
+    setLiveTxHash(hash);
+    onTrackTransaction(connectedAddress, "scan", hash, { target });
+  }
 
   useEffect(() => {
     setHistory(loadHistory());
   }, []);
 
-  async function fetchAndShowResult(targetAddress) {
-    const raw = await readContract(CONTRACT_ADDRESS, "get_last_scan", [targetAddress]);
-    const parsed = parseResult(raw);
+  useEffect(() => {
+    if (!connected) return;
+    refreshContractState(null, ["poolBalance"])
+      .then((snapshot) => setPoolBalance(snapshot.poolBalance.balance_gen))
+      .catch((e) => console.error("Could not load pool balance", e));
+  }, [connected, stateVersion]);
+
+  useEffect(() => {
+    const target = transactions.scan?.target;
+    const normalizedStatus = String(scanStatus || "SUBMITTED").toUpperCase();
+    const accepted = ["ACCEPTED", "FINALIZED"].includes(normalizedStatus);
+    if (!connected || !target) return;
+    setAddress(target);
+    if (!accepted) {
+      setPhase("scanning");
+      return;
+    }
+    if (phase !== "form" && phase !== "scanning") return;
+    fetchAndShowResult(target, 5, ({ scan }) => !scan?.error)
+      .catch((e) => console.error("Could not restore scan result", e));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [connected, transactions.scan?.hash, scanStatus]);
+
+  async function fetchAndShowResult(targetAddress, attempts = 1, predicate = null) {
+    const snapshot = await refreshContractState(
+      targetAddress,
+      ["scan", "poolBalance"],
+      { attempts, predicate },
+    );
+    const parsed = snapshot.scan;
+    setPoolBalance(snapshot.poolBalance.balance_gen);
     setResult(parsed);
     setPendingTxHash(null);
     setPhase("result");
@@ -71,8 +107,9 @@ export default function ScanTab({ connected, onRequireConnect }) {
     setLiveTxHash(null);
     setPhase("scanning");
     try {
-      await writeContract(CONTRACT_ADDRESS, "scan_wallet", [target], SCAN_FEE_GEN, setLiveTxHash);
-      await fetchAndShowResult(target);
+      await writeContract(CONTRACT_ADDRESS, "scan_wallet", [target], SCAN_FEE_GEN, (hash) => recordTxHash(target, hash));
+      await fetchAndShowResult(target, 5, ({ scan }) => !scan?.error);
+      onStateChanged();
     } catch (e) {
       console.error(e);
       if (e.isPendingTimeout) {
@@ -93,7 +130,8 @@ export default function ScanTab({ connected, onRequireConnect }) {
     setError("");
     try {
       await checkTransactionStatus(pendingTxHash);
-      await fetchAndShowResult(address.trim());
+      await fetchAndShowResult(address.trim(), 5, ({ scan }) => !scan?.error);
+      onStateChanged();
     } catch (e) {
       console.error(e);
       setError("Still not settled. This transaction is real, feel free to check it directly on the explorer, or try again shortly.");
@@ -131,6 +169,8 @@ export default function ScanTab({ connected, onRequireConnect }) {
   }
 
   const tierInfo = result?.tier ? TIER_INFO[result.tier] : null;
+  const scanPending = transactions.scan?.hash
+    && !["ACCEPTED", "FINALIZED"].includes(String(scanStatus || "").toUpperCase());
 
   return (
     <div>
@@ -148,6 +188,15 @@ export default function ScanTab({ connected, onRequireConnect }) {
           {liveStatus ? `Status: ${liveStatus}` : "Submitted, waiting on the network"}, consensus can pass through several stages before finishing.{" "}
           <a href={getExplorerTxUrl(liveTxHash)} target="_blank" rel="noreferrer" style={{ color: "var(--scan-accent)" }}>
             Watch it live on the explorer
+          </a>
+        </div>
+      )}
+
+      {transactions.scan?.hash && !liveTxHash && !pendingTxHash && (
+        <div className="status-line" style={{ marginBottom: 16 }}>
+          Transaction status: {scanStatus || "Submitted"}.{" "}
+          <a href={getExplorerTxUrl(transactions.scan.hash)} target="_blank" rel="noreferrer" style={{ color: "var(--scan-accent)", wordBreak: "break-all" }}>
+            {transactions.scan.hash}
           </a>
         </div>
       )}
@@ -181,16 +230,16 @@ export default function ScanTab({ connected, onRequireConnect }) {
               type="text"
               placeholder="0x..."
               value={address}
-              disabled={phase === "scanning"}
+              disabled={phase === "scanning" || Boolean(scanPending)}
               onChange={(e) => setAddress(e.target.value)}
             />
           </div>
           <button
             className="btn-primary scan"
             onClick={handleScan}
-            disabled={phase === "scanning"}
+            disabled={phase === "scanning" || Boolean(scanPending)}
           >
-            {phase === "scanning" ? "Reading wallet…" : `Scan for ${SCAN_FEE_GEN} GEN`}
+            {phase === "scanning" || scanPending ? "Reading wallet…" : `Scan for ${SCAN_FEE_GEN} GEN`}
           </button>
 
           {history.length > 0 && (
@@ -252,6 +301,10 @@ export default function ScanTab({ connected, onRequireConnect }) {
               <p className="page-lede" style={{ marginBottom: 16 }}>{result.behavior_profile}</p>
 
               <div className="stat-grid">
+                <div className="stat">
+                  <div className="stat-label">Pool liquidity</div>
+                  <div className="stat-value mono">{poolBalance} GEN</div>
+                </div>
                 <div className="stat">
                   <div className="stat-label">GEN balance</div>
                   <div className="stat-value mono">{Number(result.gen_balance).toFixed(2)}</div>
