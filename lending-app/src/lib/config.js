@@ -1,5 +1,5 @@
 // Paste the deployed LendingPool contract address here after deploying via Studio.
-export const CONTRACT_ADDRESS = "0x1634F4B4DcC38eFd7B7aC3dA0Cbe93284c128A5E";
+export const CONTRACT_ADDRESS = "0x9a762b14558d7C7c4732B464325C05b45B0BbACA";
 
 // Same tier boundaries as lending_pool.py's request_loan bands.
 // Kept here only for display copy, the contract is the actual source of truth.

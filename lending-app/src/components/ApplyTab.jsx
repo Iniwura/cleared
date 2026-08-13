@@ -1,10 +1,11 @@
 import { useEffect, useState } from "react";
 import RangeGauge from "./RangeGauge";
-import { writeContract, readContract, checkTransactionStatus, parseResult, getConnectedAddress, friendlyError, getExplorerTxUrl } from "../lib/gl";
+import { writeContract, checkTransactionStatus, friendlyError, getExplorerTxUrl } from "../lib/gl";
+import { refreshContractState } from "../lib/contractState";
 import { useLiveTxStatus } from "../lib/useLiveTxStatus";
 import { CONTRACT_ADDRESS, MIN_LOAN_GEN, MAX_LOAN_GEN, INTEREST_PERCENT, TERM_DAYS, TIER_INFO } from "../lib/config";
 
-export default function ApplyTab({ connected, onRequireConnect }) {
+export default function ApplyTab({ connected, address, stateVersion, onStateChanged, onRequireConnect }) {
   const [amount, setAmount] = useState(3);
   const [reason, setReason] = useState("");
   const [phase, setPhase] = useState("form"); // form | submitting | review | claiming | claimed
@@ -15,18 +16,49 @@ export default function ApplyTab({ connected, onRequireConnect }) {
   const [checkingAgain, setCheckingAgain] = useState(false);
   const [retrying, setRetrying] = useState(false);
   const [poolBalance, setPoolBalance] = useState(null);
-  const liveStatus = useLiveTxStatus(liveTxHash || pendingTxHash);
+  const [lastTxHash, setLastTxHash] = useState(null);
+  const [pendingAction, setPendingAction] = useState(null);
+  const [claimedLoan, setClaimedLoan] = useState(null);
+  const liveStatus = useLiveTxStatus(liveTxHash || pendingTxHash || lastTxHash);
 
   useEffect(() => {
     if (!connected) return;
-    readContract(CONTRACT_ADDRESS, "get_pool_balance", [])
-      .then((raw) => setPoolBalance(parseResult(raw).balance_gen))
-      .catch((e) => console.error("Could not load pool balance", e));
-  }, [connected]);
+    refreshContractState(address, ["decision", "loan", "poolBalance"])
+      .then((snapshot) => {
+        setPoolBalance(snapshot.poolBalance.balance_gen);
+        const hasOffer = snapshot.loan.exists && !snapshot.loan.claimed && !snapshot.loan.active && !snapshot.loan.defaulted;
+        if (hasOffer && snapshot.decision.approved) {
+          setResult(snapshot.decision);
+          setPhase("review");
+        }
+      })
+      .catch((e) => console.error("Could not refresh application state", e));
+  }, [connected, address, stateVersion]);
 
-  async function fetchDecision(targetAddress) {
-    const raw = await readContract(CONTRACT_ADDRESS, "get_last_decision", [targetAddress]);
-    return parseResult(raw);
+  useEffect(() => {
+    setResult(null);
+    setClaimedLoan(null);
+    setError("");
+    setPendingTxHash(null);
+    setLiveTxHash(null);
+    setLastTxHash(null);
+    setPendingAction(null);
+    setPhase("form");
+  }, [address]);
+
+  function recordTxHash(hash) {
+    setLiveTxHash(hash);
+    setLastTxHash(hash);
+  }
+
+  async function refreshApplicationState(attempts = 1) {
+    const snapshot = await refreshContractState(
+      address,
+      ["decision", "loan", "poolBalance"],
+      { attempts },
+    );
+    setPoolBalance(snapshot.poolBalance.balance_gen);
+    return snapshot;
   }
 
   async function handleSubmit() {
@@ -34,16 +66,19 @@ export default function ApplyTab({ connected, onRequireConnect }) {
       onRequireConnect();
       return;
     }
-    const address = getConnectedAddress();
+    if (!address) return;
     setError("");
     setPendingTxHash(null);
     setLiveTxHash(null);
+    setPendingAction("request");
     setPhase("submitting");
     try {
-      await writeContract(CONTRACT_ADDRESS, "request_loan", [address, String(amount), reason], 0, setLiveTxHash);
-      const parsed = await fetchDecision(address);
-      setResult(parsed);
+      await writeContract(CONTRACT_ADDRESS, "request_loan", [address, String(amount), reason], 0, recordTxHash);
+      const snapshot = await refreshApplicationState(3);
+      setResult(snapshot.decision);
+      setClaimedLoan(snapshot.loan.claimed && snapshot.loan.active ? snapshot.loan : null);
       setPhase("review");
+      onStateChanged();
     } catch (e) {
       console.error(e);
       if (e.isPendingTimeout) {
@@ -65,8 +100,8 @@ export default function ApplyTab({ connected, onRequireConnect }) {
     setRetrying(true);
     setError("");
     try {
-      const parsed = await fetchDecision(getConnectedAddress());
-      setResult(parsed);
+      const snapshot = await refreshApplicationState(3);
+      setResult(snapshot.decision);
     } catch (e) {
       console.error(e);
       setError(friendlyError(e));
@@ -81,10 +116,11 @@ export default function ApplyTab({ connected, onRequireConnect }) {
     setError("");
     try {
       await checkTransactionStatus(pendingTxHash);
-      const parsed = await fetchDecision(getConnectedAddress());
-      setResult(parsed);
+      const snapshot = await refreshApplicationState(3);
+      setResult(snapshot.decision);
       setPendingTxHash(null);
       setPhase("review");
+      onStateChanged();
     } catch (e) {
       console.error(e);
       setError("Still not settled yet. This transaction is real, feel free to check it directly on the explorer, or try again in a bit.");
@@ -94,22 +130,26 @@ export default function ApplyTab({ connected, onRequireConnect }) {
   }
 
   async function handleClaim() {
-    const address = getConnectedAddress();
+    if (!address || phase === "claiming" || (pendingTxHash && pendingAction === "claim") || claimAwaitingFinality) return;
     setError("");
     setPendingTxHash(null);
     setLiveTxHash(null);
     setPhase("claiming");
+    setPendingAction("claim");
     try {
-      await writeContract(CONTRACT_ADDRESS, "claim_loan", [address], 0, setLiveTxHash);
-      const raw = await readContract(CONTRACT_ADDRESS, "get_last_decision", [address]);
-      const claimResult = parseResult(raw);
-      if (claimResult.success === false) {
-        setError(claimResult.message || "Claim did not go through.");
+      await writeContract(CONTRACT_ADDRESS, "claim_loan", [address], 0, recordTxHash);
+      const snapshot = await refreshApplicationState(3);
+      const loan = snapshot.loan;
+      const claimResult = snapshot.decision;
+      if (!loan.claimed || !loan.active) {
+        setError(claimResult.message || "Claim finalized, but the loan is not active.");
         setPhase("review");
         return;
       }
       setResult((prev) => ({ ...prev, ...claimResult }));
+      setClaimedLoan(loan);
       setPhase("claimed");
+      onStateChanged();
     } catch (e) {
       console.error(e);
       if (e.isPendingTimeout) {
@@ -130,12 +170,17 @@ export default function ApplyTab({ connected, onRequireConnect }) {
     setError("");
     try {
       await checkTransactionStatus(pendingTxHash);
-      const address = getConnectedAddress();
-      const raw = await readContract(CONTRACT_ADDRESS, "get_last_decision", [address]);
-      const claimResult = parseResult(raw);
+      const snapshot = await refreshApplicationState(3);
+      const loan = snapshot.loan;
+      const claimResult = snapshot.decision;
       setResult((prev) => ({ ...prev, ...claimResult }));
+      setClaimedLoan(loan.claimed && loan.active ? loan : null);
       setPendingTxHash(null);
-      setPhase(claimResult.success === false ? "review" : "claimed");
+      if (!loan.claimed || !loan.active) {
+        setError(claimResult.message || "Claim finalized, but the loan is not active.");
+      }
+      setPhase(loan.claimed && loan.active ? "claimed" : "review");
+      onStateChanged();
     } catch (e) {
       console.error(e);
       setError("Still not settled. Check the explorer directly if you want certainty before trying again.");
@@ -148,6 +193,7 @@ export default function ApplyTab({ connected, onRequireConnect }) {
     setResult(null);
     setError("");
     setPendingTxHash(null);
+    setClaimedLoan(null);
     setPhase("form");
   }
 
@@ -155,6 +201,9 @@ export default function ApplyTab({ connected, onRequireConnect }) {
   const tierInfo = tierKey ? TIER_INFO[tierKey] : null;
   const approvedGen = result?.approved_wei != null ? result.approved_wei / 1e18 : null;
   const owedGen = result?.owed_wei != null ? result.owed_wei / 1e18 : null;
+  const claimAwaitingFinality = lastTxHash
+    && pendingAction === "claim"
+    && String(liveStatus || "").toUpperCase() !== "FINALIZED";
 
   return (
     <div>
@@ -177,6 +226,15 @@ export default function ApplyTab({ connected, onRequireConnect }) {
         </div>
       )}
 
+      {lastTxHash && !liveTxHash && !pendingTxHash && (
+        <div className="status-line" style={{ marginBottom: 16 }}>
+          Transaction status: {liveStatus || "Submitted"}.{" "}
+          <a href={getExplorerTxUrl(lastTxHash)} target="_blank" rel="noreferrer" style={{ color: "var(--accent)", wordBreak: "break-all" }}>
+            {lastTxHash}
+          </a>
+        </div>
+      )}
+
       {error && (
         <div className="error-box">
           {error}
@@ -192,7 +250,7 @@ export default function ApplyTab({ connected, onRequireConnect }) {
               </div>
               <button
                 className="btn-primary"
-                onClick={phase === "claiming" ? handleCheckClaimAgain : handleCheckAgain}
+                onClick={pendingAction === "claim" ? handleCheckClaimAgain : handleCheckAgain}
                 disabled={checkingAgain}
               >
                 {checkingAgain ? "Checking…" : "Check status again"}
@@ -325,8 +383,8 @@ export default function ApplyTab({ connected, onRequireConnect }) {
                     </div>
                   </div>
 
-                  <button className="btn-primary" onClick={handleClaim} disabled={phase === "claiming"}>
-                    {phase === "claiming" ? "Claiming…" : `Claim ${approvedGen} GEN`}
+                  <button className="btn-primary" onClick={handleClaim} disabled={phase === "claiming" || (pendingTxHash && pendingAction === "claim") || claimAwaitingFinality}>
+                    {phase === "claiming" ? "Claiming…" : pendingTxHash && pendingAction === "claim" ? "Awaiting claim finalization" : `Claim ${approvedGen} GEN`}
                   </button>
                   <p className="status-line" style={{ marginTop: 10 }}>
                     Nothing has moved yet. This is a review of what you'd get, claiming is a separate step.
@@ -352,20 +410,24 @@ export default function ApplyTab({ connected, onRequireConnect }) {
             </span>
           </div>
           <p className="page-lede" style={{ marginBottom: 16 }}>
-            Claimed. {approvedGen} GEN is in your wallet now.
+            Claimed. The active loan records {claimedLoan?.principal_gen ?? approvedGen} GEN paid out.
           </p>
           <div className="stat-grid">
             <div className="stat">
               <div className="stat-label">Received</div>
-              <div className="stat-value mono">{approvedGen} GEN</div>
+              <div className="stat-value mono">{claimedLoan?.principal_gen ?? approvedGen} GEN</div>
             </div>
             <div className="stat">
               <div className="stat-label">Owed</div>
-              <div className="stat-value mono">{owedGen} GEN</div>
+              <div className="stat-value mono">{claimedLoan?.owed_gen ?? owedGen} GEN</div>
             </div>
             <div className="stat">
               <div className="stat-label">Due</div>
-              <div className="stat-value mono">{result.due_at?.slice(0, 10)}</div>
+              <div className="stat-value mono">{claimedLoan?.due_at?.slice(0, 10)}</div>
+            </div>
+            <div className="stat">
+              <div className="stat-label">Pool liquidity</div>
+              <div className="stat-value mono">{poolBalance} GEN</div>
             </div>
           </div>
           <button className="btn-primary" onClick={reset} style={{ marginTop: 20 }}>

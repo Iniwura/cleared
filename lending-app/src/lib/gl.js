@@ -10,11 +10,13 @@ export async function connectWallet(onChangeCallback) {
     throw new Error("No wallet extension found. Install Rabby or MetaMask, then reload this page.");
   }
   const accounts = await window.ethereum.request({ method: "eth_requestAccounts" });
+  if (!accounts?.[0]) throw new Error("Wallet connected without exposing an account.");
   connectedAddress = accounts[0];
 
   client = createClient({
     chain: testnetBradbury,
     account: connectedAddress,
+    provider: window.ethereum,
   });
 
   if (onChangeCallback) {
@@ -28,18 +30,21 @@ export async function connectWallet(onChangeCallback) {
 
 function handleAccountsChanged(accounts) {
   if (!accounts || accounts.length === 0) {
+    const callback = onAccountChange;
     disconnectWallet();
-    onAccountChange?.(null);
+    callback?.(null);
     return;
   }
   connectedAddress = accounts[0];
-  client = createClient({ chain: testnetBradbury, account: connectedAddress });
+  client = createClient({ chain: testnetBradbury, account: connectedAddress, provider: window.ethereum });
   onAccountChange?.(connectedAddress);
 }
 
 export function disconnectWallet() {
+  window.ethereum?.removeListener?.("accountsChanged", handleAccountsChanged);
   client = null;
   connectedAddress = null;
+  onAccountChange = null;
 }
 
 export function getConnectedAddress() {
@@ -98,9 +103,17 @@ export function getExplorerTxUrl(txHash) {
   return `https://explorer-bradbury.genlayer.com/tx/${txHash}`;
 }
 
+function genToWei(valueGen) {
+  const value = String(valueGen);
+  if (!/^\d+(\.\d+)?$/.test(value)) throw new Error("Invalid GEN value.");
+  const [whole, fraction = ""] = value.split(".");
+  if (fraction.length > 18) throw new Error("GEN value has more than 18 decimal places.");
+  return BigInt(whole) * 10n ** 18n + BigInt((fraction + "0".repeat(18)).slice(0, 18));
+}
+
 export async function writeContract(contractAddress, functionName, args = [], valueGen = 0, onHash = null) {
   const c = requireClient();
-  const valueWei = BigInt(Math.round(valueGen * 1e18));
+  const valueWei = genToWei(valueGen);
 
   const txHash = await c.writeContract({
     address: contractAddress,
@@ -130,13 +143,13 @@ export async function writeContract(contractAddress, functionName, args = [], va
   }
 }
 
-// Re-checks an already-submitted transaction by hash, no new transaction sent.
+// Re-checks an already-submitted transaction through ACCEPTED, no new transaction sent.
 export async function checkTransactionStatus(txHash) {
   const c = requireClient();
   const receipt = await c.waitForTransactionReceipt({
     hash: txHash,
     status: "ACCEPTED",
-    retries: 20,
+    retries: 90,
     interval: 3000,
   });
   return receipt;

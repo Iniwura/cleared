@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
-import { writeContract, readContract, checkTransactionStatus, parseResult, friendlyError, getExplorerTxUrl } from "../lib/gl";
+import { writeContract, checkTransactionStatus, friendlyError, getExplorerTxUrl } from "../lib/gl";
 import { useLiveTxStatus } from "../lib/useLiveTxStatus";
 import { CONTRACT_ADDRESS, TIER_INFO, SCAN_FEE_GEN } from "../lib/config";
+import { refreshContractState } from "../lib/contractState";
 
 const HISTORY_KEY = "cleared_scan_history";
 const MAX_HISTORY = 10;
@@ -29,7 +30,7 @@ function saveToHistory(address, result) {
   return updated;
 }
 
-export default function ScanTab({ connected, onRequireConnect }) {
+export default function ScanTab({ connected, stateVersion, onStateChanged, onRequireConnect }) {
   const [address, setAddress] = useState("");
   const [phase, setPhase] = useState("form");
   const [result, setResult] = useState(null);
@@ -39,15 +40,34 @@ export default function ScanTab({ connected, onRequireConnect }) {
   const [checkingAgain, setCheckingAgain] = useState(false);
   const [history, setHistory] = useState([]);
   const [retrying, setRetrying] = useState(false);
-  const liveStatus = useLiveTxStatus(liveTxHash || pendingTxHash);
+  const [poolBalance, setPoolBalance] = useState(null);
+  const [lastTxHash, setLastTxHash] = useState(null);
+  const liveStatus = useLiveTxStatus(liveTxHash || pendingTxHash || lastTxHash);
+
+  function recordTxHash(hash) {
+    setLiveTxHash(hash);
+    setLastTxHash(hash);
+  }
 
   useEffect(() => {
     setHistory(loadHistory());
   }, []);
 
-  async function fetchAndShowResult(targetAddress) {
-    const raw = await readContract(CONTRACT_ADDRESS, "get_last_scan", [targetAddress]);
-    const parsed = parseResult(raw);
+  useEffect(() => {
+    if (!connected) return;
+    refreshContractState(null, ["poolBalance"])
+      .then((snapshot) => setPoolBalance(snapshot.poolBalance.balance_gen))
+      .catch((e) => console.error("Could not load pool balance", e));
+  }, [connected, stateVersion]);
+
+  async function fetchAndShowResult(targetAddress, attempts = 1) {
+    const snapshot = await refreshContractState(
+      targetAddress,
+      ["scan", "poolBalance"],
+      { attempts },
+    );
+    const parsed = snapshot.scan;
+    setPoolBalance(snapshot.poolBalance.balance_gen);
     setResult(parsed);
     setPendingTxHash(null);
     setPhase("result");
@@ -71,8 +91,9 @@ export default function ScanTab({ connected, onRequireConnect }) {
     setLiveTxHash(null);
     setPhase("scanning");
     try {
-      await writeContract(CONTRACT_ADDRESS, "scan_wallet", [target], SCAN_FEE_GEN, setLiveTxHash);
-      await fetchAndShowResult(target);
+      await writeContract(CONTRACT_ADDRESS, "scan_wallet", [target], SCAN_FEE_GEN, recordTxHash);
+      await fetchAndShowResult(target, 3);
+      onStateChanged();
     } catch (e) {
       console.error(e);
       if (e.isPendingTimeout) {
@@ -93,7 +114,8 @@ export default function ScanTab({ connected, onRequireConnect }) {
     setError("");
     try {
       await checkTransactionStatus(pendingTxHash);
-      await fetchAndShowResult(address.trim());
+      await fetchAndShowResult(address.trim(), 3);
+      onStateChanged();
     } catch (e) {
       console.error(e);
       setError("Still not settled. This transaction is real, feel free to check it directly on the explorer, or try again shortly.");
@@ -148,6 +170,15 @@ export default function ScanTab({ connected, onRequireConnect }) {
           {liveStatus ? `Status: ${liveStatus}` : "Submitted, waiting on the network"}, consensus can pass through several stages before finishing.{" "}
           <a href={getExplorerTxUrl(liveTxHash)} target="_blank" rel="noreferrer" style={{ color: "var(--scan-accent)" }}>
             Watch it live on the explorer
+          </a>
+        </div>
+      )}
+
+      {lastTxHash && !liveTxHash && !pendingTxHash && (
+        <div className="status-line" style={{ marginBottom: 16 }}>
+          Transaction status: {liveStatus || "Submitted"}.{" "}
+          <a href={getExplorerTxUrl(lastTxHash)} target="_blank" rel="noreferrer" style={{ color: "var(--scan-accent)", wordBreak: "break-all" }}>
+            {lastTxHash}
           </a>
         </div>
       )}
@@ -252,6 +283,10 @@ export default function ScanTab({ connected, onRequireConnect }) {
               <p className="page-lede" style={{ marginBottom: 16 }}>{result.behavior_profile}</p>
 
               <div className="stat-grid">
+                <div className="stat">
+                  <div className="stat-label">Pool liquidity</div>
+                  <div className="stat-value mono">{poolBalance} GEN</div>
+                </div>
                 <div className="stat">
                   <div className="stat-label">GEN balance</div>
                   <div className="stat-value mono">{Number(result.gen_balance).toFixed(2)}</div>

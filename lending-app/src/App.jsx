@@ -11,6 +11,11 @@ export default function App() {
   const [connecting, setConnecting] = useState(false);
   const [connectError, setConnectError] = useState("");
   const [menuOpen, setMenuOpen] = useState(false);
+  const [stateVersion, setStateVersion] = useState(0);
+
+  function notifyStateChanged() {
+    setStateVersion((version) => version + 1);
+  }
 
   async function handleConnect() {
     setConnecting(true);
@@ -96,10 +101,10 @@ export default function App() {
       </nav>
 
       {tab === "home" && <HomeTab onNavigate={setTab} />}
-      {tab === "apply" && <ApplyTab connected={Boolean(address)} onRequireConnect={handleConnect} />}
-      {tab === "scan" && <ScanTab connected={Boolean(address)} onRequireConnect={handleConnect} />}
+      {tab === "apply" && <ApplyTab connected={Boolean(address)} address={address} stateVersion={stateVersion} onStateChanged={notifyStateChanged} onRequireConnect={handleConnect} />}
+      {tab === "scan" && <ScanTab connected={Boolean(address)} stateVersion={stateVersion} onStateChanged={notifyStateChanged} onRequireConnect={handleConnect} />}
       {tab === "profile" && (
-        <ProfileTab connected={Boolean(address)} address={address} onRequireConnect={handleConnect} />
+        <ProfileTab connected={Boolean(address)} address={address} stateVersion={stateVersion} onStateChanged={notifyStateChanged} onRequireConnect={handleConnect} />
       )}
     </div>
   );
