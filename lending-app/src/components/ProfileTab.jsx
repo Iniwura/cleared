@@ -4,7 +4,7 @@ import { useLiveTxStatus } from "../lib/useLiveTxStatus";
 import { CONTRACT_ADDRESS } from "../lib/config";
 import { refreshContractState } from "../lib/contractState";
 
-export default function ProfileTab({ connected, address, stateVersion, onStateChanged, onRequireConnect }) {
+export default function ProfileTab({ connected, address, transactions, onTrackTransaction, stateVersion, onStateChanged, onRequireConnect }) {
   const [loan, setLoan] = useState(null);
   const [repaymentCount, setRepaymentCount] = useState(null);
   const [poolBalance, setPoolBalance] = useState(null);
@@ -16,16 +16,24 @@ export default function ProfileTab({ connected, address, stateVersion, onStateCh
   const [pendingTxHash, setPendingTxHash] = useState(null);
   const [pendingAction, setPendingAction] = useState(null); // "claim" | "repay"
   const [checkingAgain, setCheckingAgain] = useState(false);
-  const [lastTxHash, setLastTxHash] = useState(null);
   const refreshId = useRef(0);
-  const liveStatus = useLiveTxStatus(liveTxHash || pendingTxHash || lastTxHash);
+  const claimStatus = transactions.claim?.status;
+  const repaymentStatus = transactions.repay?.status;
+  const defaultStatus = transactions["default-check"]?.status;
+  const latestTransaction = [transactions.claim, transactions.repay, transactions["default-check"]]
+    .filter(Boolean)
+    .sort((a, b) => b.submittedAt - a.submittedAt)[0];
+  const trackedStatus = latestTransaction?.action === "claim"
+    ? claimStatus
+    : latestTransaction?.action === "repay" ? repaymentStatus : defaultStatus;
+  const liveStatus = useLiveTxStatus(liveTxHash || pendingTxHash);
 
-  function recordTxHash(hash) {
+  function recordTxHash(action, hash) {
     setLiveTxHash(hash);
-    setLastTxHash(hash);
+    onTrackTransaction(address, action, hash);
   }
 
-  const loadProfile = useCallback(async (attempts = 1) => {
+  const loadProfile = useCallback(async (attempts = 1, predicate = null) => {
     if (!connected || !address) return;
     const requestId = ++refreshId.current;
     setLoading(true);
@@ -34,7 +42,7 @@ export default function ProfileTab({ connected, address, stateVersion, onStateCh
       const contractState = await refreshContractState(
         address,
         ["loan", "repaymentCount", "poolBalance"],
-        { attempts },
+        { attempts, predicate },
       );
       const snapshot = {
         loan: contractState.loan,
@@ -66,7 +74,6 @@ export default function ProfileTab({ connected, address, stateVersion, onStateCh
     setLiveTxHash(null);
     setPendingTxHash(null);
     setPendingAction(null);
-    setLastTxHash(null);
   }, [connected, address]);
 
   useEffect(() => {
@@ -80,7 +87,15 @@ export default function ProfileTab({ connected, address, stateVersion, onStateCh
     const contractState = await refreshContractState(
       address,
       ["decision", "loan", "repaymentCount", "poolBalance"],
-      { attempts: 3 },
+      {
+        attempts: 5,
+        predicate: ({ loan, repaymentCount: count }) => (
+          loan?.exists
+          && !loan.active
+          && !loan.defaulted
+          && count?.repayment_count > repaymentCount
+        ),
+      },
     );
     const decision = contractState.decision;
     if (decision.success === false) {
@@ -95,21 +110,21 @@ export default function ProfileTab({ connected, address, stateVersion, onStateCh
   }
 
   async function verifyClaimAndReload() {
-    const snapshot = await loadProfile(3);
+    const snapshot = await loadProfile(5, ({ loan: refreshedLoan }) => refreshedLoan?.claimed && refreshedLoan?.active);
     if (!snapshot) return;
     const currentLoan = snapshot.loan;
     if (!currentLoan.claimed || !currentLoan.active) {
       const decisionRaw = await readContract(CONTRACT_ADDRESS, "get_last_decision", [address]);
       const decision = parseResult(decisionRaw);
-      setError(decision.message || "Claim finalized, but the loan is not active.");
+      setError(decision.message || "Claim was accepted, but the active loan state is not visible yet.");
       return;
     }
     setLoan(currentLoan);
-    setSuccessMsg(`Claim finalized. ${currentLoan.principal_gen} GEN is active and due ${currentLoan.due_at?.slice(0, 10)}.`);
+    setSuccessMsg(`Claim accepted. ${currentLoan.principal_gen} GEN is active and due ${currentLoan.due_at?.slice(0, 10)}.`);
   }
 
   async function handleClaim() {
-    if (busy || pendingTxHash) return;
+    if (busy || pendingTxHash || claimAwaitingFinality) return;
     setBusy(true);
     setError("");
     setSuccessMsg("");
@@ -117,7 +132,7 @@ export default function ProfileTab({ connected, address, stateVersion, onStateCh
     setLiveTxHash(null);
     setPendingAction("claim");
     try {
-      await writeContract(CONTRACT_ADDRESS, "claim_loan", [address], 0, recordTxHash);
+      await writeContract(CONTRACT_ADDRESS, "claim_loan", [address], 0, (hash) => recordTxHash("claim", hash));
       await verifyClaimAndReload();
       onStateChanged();
     } catch (e) {
@@ -135,7 +150,7 @@ export default function ProfileTab({ connected, address, stateVersion, onStateCh
   }
 
   async function handleRepay() {
-    if (!loan?.owed_gen) return;
+    if (!loan?.owed_gen || busy || pendingTxHash || repaymentAwaitingFinality) return;
     setBusy(true);
     setError("");
     setSuccessMsg("");
@@ -143,7 +158,7 @@ export default function ProfileTab({ connected, address, stateVersion, onStateCh
     setLiveTxHash(null);
     setPendingAction("repay");
     try {
-      await writeContract(CONTRACT_ADDRESS, "repay_loan", [address], loan.owed_gen, recordTxHash);
+      await writeContract(CONTRACT_ADDRESS, "repay_loan", [address], loan.owed_gen, (hash) => recordTxHash("repay", hash));
       await fetchDecisionAndReload();
       onStateChanged();
     } catch (e) {
@@ -171,7 +186,7 @@ export default function ProfileTab({ connected, address, stateVersion, onStateCh
         await verifyClaimAndReload();
       } else if (pendingAction === "default-check") {
         await loadProfile();
-        setSuccessMsg("Default check finalized against live contract state.");
+        setSuccessMsg("Default check accepted and reflected in live contract state.");
       } else {
         await fetchDecisionAndReload();
       }
@@ -192,8 +207,8 @@ export default function ProfileTab({ connected, address, stateVersion, onStateCh
     setLiveTxHash(null);
     setPendingAction("default-check");
     try {
-      await writeContract(CONTRACT_ADDRESS, "check_default", [address], 0, recordTxHash);
-      await loadProfile(3);
+      await writeContract(CONTRACT_ADDRESS, "check_default", [address], 0, (hash) => recordTxHash("default-check", hash));
+      await loadProfile(5);
       setSuccessMsg("Default check ran against live network data.");
       onStateChanged();
     } catch (e) {
@@ -227,9 +242,10 @@ export default function ProfileTab({ connected, address, stateVersion, onStateCh
 
   const hasUnclaimedOffer = loan?.exists && !loan.claimed && !loan.active && !loan.defaulted;
   const hasOpenBalance = loan?.exists && (loan.active || loan.defaulted);
-  const awaitingFinality = lastTxHash && String(liveStatus || "").toUpperCase() !== "FINALIZED";
-  const claimAwaitingFinality = awaitingFinality && pendingAction === "claim";
-  const repaymentAwaitingFinality = awaitingFinality && pendingAction === "repay";
+  const claimAwaitingFinality = transactions.claim?.hash
+    && String(claimStatus || "").toUpperCase() !== "FINALIZED";
+  const repaymentAwaitingFinality = transactions.repay?.hash
+    && String(repaymentStatus || "").toUpperCase() !== "FINALIZED";
 
   return (
     <div>
@@ -249,11 +265,11 @@ export default function ProfileTab({ connected, address, stateVersion, onStateCh
         </div>
       )}
 
-      {lastTxHash && !liveTxHash && !pendingTxHash && (
+      {latestTransaction && !liveTxHash && !pendingTxHash && (
         <div className="status-line" style={{ marginBottom: 16 }}>
-          Transaction status: {liveStatus || "Submitted"}.{" "}
-          <a href={getExplorerTxUrl(lastTxHash)} target="_blank" rel="noreferrer" style={{ color: "var(--accent)", wordBreak: "break-all" }}>
-            {lastTxHash}
+          Transaction status: {trackedStatus || "Submitted"}.{" "}
+          <a href={getExplorerTxUrl(latestTransaction.hash)} target="_blank" rel="noreferrer" style={{ color: "var(--accent)", wordBreak: "break-all" }}>
+            {latestTransaction.hash}
           </a>
         </div>
       )}

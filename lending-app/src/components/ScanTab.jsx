@@ -30,8 +30,8 @@ function saveToHistory(address, result) {
   return updated;
 }
 
-export default function ScanTab({ connected, stateVersion, onStateChanged, onRequireConnect }) {
-  const [address, setAddress] = useState("");
+export default function ScanTab({ connected, address: connectedAddress, transactions, onTrackTransaction, stateVersion, onStateChanged, onRequireConnect }) {
+  const [address, setAddress] = useState(transactions.scan?.target || "");
   const [phase, setPhase] = useState("form");
   const [result, setResult] = useState(null);
   const [error, setError] = useState("");
@@ -41,12 +41,12 @@ export default function ScanTab({ connected, stateVersion, onStateChanged, onReq
   const [history, setHistory] = useState([]);
   const [retrying, setRetrying] = useState(false);
   const [poolBalance, setPoolBalance] = useState(null);
-  const [lastTxHash, setLastTxHash] = useState(null);
-  const liveStatus = useLiveTxStatus(liveTxHash || pendingTxHash || lastTxHash);
+  const scanStatus = transactions.scan?.status;
+  const liveStatus = useLiveTxStatus(liveTxHash || pendingTxHash);
 
-  function recordTxHash(hash) {
+  function recordTxHash(target, hash) {
     setLiveTxHash(hash);
-    setLastTxHash(hash);
+    onTrackTransaction(connectedAddress, "scan", hash, { target });
   }
 
   useEffect(() => {
@@ -60,11 +60,27 @@ export default function ScanTab({ connected, stateVersion, onStateChanged, onReq
       .catch((e) => console.error("Could not load pool balance", e));
   }, [connected, stateVersion]);
 
-  async function fetchAndShowResult(targetAddress, attempts = 1) {
+  useEffect(() => {
+    const target = transactions.scan?.target;
+    const normalizedStatus = String(scanStatus || "SUBMITTED").toUpperCase();
+    const accepted = ["ACCEPTED", "FINALIZED"].includes(normalizedStatus);
+    if (!connected || !target) return;
+    setAddress(target);
+    if (!accepted) {
+      setPhase("scanning");
+      return;
+    }
+    if (phase !== "form" && phase !== "scanning") return;
+    fetchAndShowResult(target, 5, ({ scan }) => !scan?.error)
+      .catch((e) => console.error("Could not restore scan result", e));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [connected, transactions.scan?.hash, scanStatus]);
+
+  async function fetchAndShowResult(targetAddress, attempts = 1, predicate = null) {
     const snapshot = await refreshContractState(
       targetAddress,
       ["scan", "poolBalance"],
-      { attempts },
+      { attempts, predicate },
     );
     const parsed = snapshot.scan;
     setPoolBalance(snapshot.poolBalance.balance_gen);
@@ -91,8 +107,8 @@ export default function ScanTab({ connected, stateVersion, onStateChanged, onReq
     setLiveTxHash(null);
     setPhase("scanning");
     try {
-      await writeContract(CONTRACT_ADDRESS, "scan_wallet", [target], SCAN_FEE_GEN, recordTxHash);
-      await fetchAndShowResult(target, 3);
+      await writeContract(CONTRACT_ADDRESS, "scan_wallet", [target], SCAN_FEE_GEN, (hash) => recordTxHash(target, hash));
+      await fetchAndShowResult(target, 5, ({ scan }) => !scan?.error);
       onStateChanged();
     } catch (e) {
       console.error(e);
@@ -114,7 +130,7 @@ export default function ScanTab({ connected, stateVersion, onStateChanged, onReq
     setError("");
     try {
       await checkTransactionStatus(pendingTxHash);
-      await fetchAndShowResult(address.trim(), 3);
+      await fetchAndShowResult(address.trim(), 5, ({ scan }) => !scan?.error);
       onStateChanged();
     } catch (e) {
       console.error(e);
@@ -153,6 +169,8 @@ export default function ScanTab({ connected, stateVersion, onStateChanged, onReq
   }
 
   const tierInfo = result?.tier ? TIER_INFO[result.tier] : null;
+  const scanPending = transactions.scan?.hash
+    && !["ACCEPTED", "FINALIZED"].includes(String(scanStatus || "").toUpperCase());
 
   return (
     <div>
@@ -174,11 +192,11 @@ export default function ScanTab({ connected, stateVersion, onStateChanged, onReq
         </div>
       )}
 
-      {lastTxHash && !liveTxHash && !pendingTxHash && (
+      {transactions.scan?.hash && !liveTxHash && !pendingTxHash && (
         <div className="status-line" style={{ marginBottom: 16 }}>
-          Transaction status: {liveStatus || "Submitted"}.{" "}
-          <a href={getExplorerTxUrl(lastTxHash)} target="_blank" rel="noreferrer" style={{ color: "var(--scan-accent)", wordBreak: "break-all" }}>
-            {lastTxHash}
+          Transaction status: {scanStatus || "Submitted"}.{" "}
+          <a href={getExplorerTxUrl(transactions.scan.hash)} target="_blank" rel="noreferrer" style={{ color: "var(--scan-accent)", wordBreak: "break-all" }}>
+            {transactions.scan.hash}
           </a>
         </div>
       )}
@@ -212,16 +230,16 @@ export default function ScanTab({ connected, stateVersion, onStateChanged, onReq
               type="text"
               placeholder="0x..."
               value={address}
-              disabled={phase === "scanning"}
+              disabled={phase === "scanning" || Boolean(scanPending)}
               onChange={(e) => setAddress(e.target.value)}
             />
           </div>
           <button
             className="btn-primary scan"
             onClick={handleScan}
-            disabled={phase === "scanning"}
+            disabled={phase === "scanning" || Boolean(scanPending)}
           >
-            {phase === "scanning" ? "Reading wallet…" : `Scan for ${SCAN_FEE_GEN} GEN`}
+            {phase === "scanning" || scanPending ? "Reading wallet…" : `Scan for ${SCAN_FEE_GEN} GEN`}
           </button>
 
           {history.length > 0 && (

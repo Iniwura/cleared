@@ -111,6 +111,31 @@ function genToWei(valueGen) {
   return BigInt(whole) * 10n ** 18n + BigInt((fraction + "0".repeat(18)).slice(0, 18));
 }
 
+const TRANSACTION_STATUS_BY_NUMBER = {
+  0: "UNINITIALIZED",
+  1: "PENDING",
+  2: "PROPOSING",
+  3: "COMMITTING",
+  4: "REVEALING",
+  5: "ACCEPTED",
+  6: "UNDETERMINED",
+  7: "FINALIZED",
+  8: "CANCELED",
+  9: "APPEAL_REVEALING",
+  10: "APPEAL_COMMITTING",
+  11: "READY_TO_FINALIZE",
+  12: "VALIDATORS_TIMEOUT",
+  13: "LEADER_TIMEOUT",
+};
+
+export function getTransactionStatus(transaction) {
+  const status = transaction?.statusName ?? transaction?.status_name ?? transaction?.status;
+  if (typeof status === "number" || /^\d+$/.test(String(status || ""))) {
+    return TRANSACTION_STATUS_BY_NUMBER[Number(status)] || "SUBMITTED";
+  }
+  return String(status || "SUBMITTED").toUpperCase();
+}
+
 export async function writeContract(contractAddress, functionName, args = [], valueGen = 0, onHash = null) {
   const c = requireClient();
   const valueWei = genToWei(valueGen);
@@ -157,7 +182,7 @@ export async function checkTransactionStatus(txHash) {
 
 // Contract methods return JSON strings, parse them consistently in one place.
 export function parseResult(raw) {
-  console.log("Raw contract result:", raw);
+  if (import.meta.env.DEV) console.log("Raw contract result:", raw);
   if (typeof raw !== "string") return raw;
   try {
     return JSON.parse(raw);
