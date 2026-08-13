@@ -1,4 +1,4 @@
-// Paste the deployed LendingPool contract address here after deploying via Studio.
+// Canonical Cleared LendingPool deployment on GenLayer Bradbury Testnet (chain ID 4221).
 export const CONTRACT_ADDRESS = "0x9a762b14558d7C7c4732B464325C05b45B0BbACA";
 
 // Same tier boundaries as lending_pool.py's request_loan bands.
